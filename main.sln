@@ -1,0 +1,328 @@
+#define SDL_MAIN_HANDLED
+#include <SDL.h>
+#include <SDL_ttf.h>
+#include <sqlite3.h>
+#include <stdio.h>
+#include <string.h>
+
+#define SCREEN_WIDTH 1000
+#define SCREEN_HEIGHT 700
+#define MAX_TASKS 10
+#define TASK_LENGTH 100
+#define MAX_DAYS 31
+
+// SQLite 데이터베이스 변수
+sqlite3* db;
+char* err_msg = 0;
+
+// 할 일 데이터
+char tasks[MAX_DAYS][MAX_TASKS][TASK_LENGTH];
+int task_counts[MAX_DAYS] = { 0 };
+int is_checked[MAX_DAYS][MAX_TASKS] = { 0 }; // 체크박스 상태
+int selected_day = 1;
+char input_buffer[TASK_LENGTH] = "";
+
+// 텍스트 렌더링 함수
+void render_text(SDL_Renderer* renderer, TTF_Font* font, const char* text, int x, int y, SDL_Color color) {
+    if (text == NULL || strlen(text) == 0) {
+        return;
+    }
+
+    SDL_Surface* surface = TTF_RenderText_Solid(font, text, color);
+    if (!surface) {
+        printf("TTF_RenderText_Solid 에러: %s\n", TTF_GetError());
+        return;
+    }
+
+    SDL_Texture* texture = SDL_CreateTextureFromSurface(renderer, surface);
+    SDL_Rect text_rect = { x, y, surface->w, surface->h };
+    SDL_RenderCopy(renderer, texture, NULL, &text_rect);
+
+    SDL_FreeSurface(surface);
+    SDL_DestroyTexture(texture);
+}
+
+// 체크박스 렌더링 함수
+void render_checkbox(SDL_Renderer* renderer, int x, int y, int checked) {
+    SDL_Rect box = { x, y, 20, 20 };
+    SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255);
+    SDL_RenderDrawRect(renderer, &box);
+
+    if (checked) {
+        SDL_SetRenderDrawColor(renderer, 0, 128, 0, 255);
+        SDL_RenderFillRect(renderer, &box);
+    }
+}
+
+// 삭제 작업 함수
+void delete_task(int day, int task_index) {
+    if (task_index < 0 || task_index >= task_counts[day - 1]) return;
+
+    for (int i = task_index; i < task_counts[day - 1] - 1; i++) {
+        strncpy_s(tasks[day - 1][i], sizeof(tasks[day - 1][i]), tasks[day - 1][i + 1], TASK_LENGTH - 1);
+        is_checked[day - 1][i] = is_checked[day - 1][i + 1];
+    }
+    task_counts[day - 1]--;
+
+    // SQLite에서 할 일 삭제
+    char sql[256];
+    snprintf(sql, sizeof(sql), "DELETE FROM tasks WHERE day = %d AND task = '%s';", day, tasks[day - 1][task_index]);
+    sqlite3_exec(db, sql, 0, 0, &err_msg);
+}
+
+// 달력 렌더링 함수
+void render_calendar(SDL_Renderer* renderer, TTF_Font* font) {
+    SDL_Color black = { 0, 0, 0, 255 };
+    const char* days_of_week[] = { "Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat" };
+
+    // 요일 렌더링
+    for (int i = 0; i < 7; i++) {
+        render_text(renderer, font, days_of_week[i], 50 + i * 100, 70, black);
+    }
+
+    // 날짜 렌더링
+    for (int i = 0; i < MAX_DAYS; i++) {
+        int x = 50 + (i % 7) * 100; // 열 위치
+        int y = 100 + (i / 7) * 50;  // 행 위치
+        char day_text[3];
+        sprintf_s(day_text, sizeof(day_text), "%d", i + 1);
+
+        SDL_Rect box = { x, y + 30, 40, 40 };
+
+        int status = 0; // 기본 상태
+        if (task_counts[i] > 0) {
+            status = 1; // 할 일이 있음
+            for (int j = 0; j < task_counts[i]; j++) {
+                if (!is_checked[i][j]) {
+                    status = 1; // 할 일이 남아 있음
+                    break;
+                }
+                status = 2; // 모든 할 일 완료
+            }
+        }
+
+        if (selected_day == i + 1) {
+            SDL_SetRenderDrawColor(renderer, 128, 128, 128, 255); // 선택된 날짜
+        }
+        else if (status == 1) {
+            SDL_SetRenderDrawColor(renderer, 135, 206, 250, 255); // 하늘색
+        }
+        else if (status == 2) {
+            SDL_SetRenderDrawColor(renderer, 0, 255, 0, 255); // 초록색
+        }
+        else {
+            SDL_SetRenderDrawColor(renderer, 200, 200, 200, 255); // 기본 색
+        }
+
+        SDL_RenderFillRect(renderer, &box);
+        SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255);
+        SDL_RenderDrawRect(renderer, &box);
+
+        render_text(renderer, font, day_text, x + 10, y + 40, black);
+    }
+}
+
+// 배경 렌더링 함수
+void render_background(SDL_Renderer* renderer) {
+    SDL_SetRenderDrawColor(renderer, 252, 223, 193, 255); // 연한 살구색 (#FCDFC1)
+    SDL_RenderClear(renderer);
+}
+
+// 입력 필드 렌더링 함수
+void render_input_field(SDL_Renderer* renderer, TTF_Font* font, const char* input, int x, int y) {
+    SDL_Rect input_box = { x - 10, y - 10, 400, 40 };
+    SDL_SetRenderDrawColor(renderer, 255, 255, 255, 255); // 흰색 입력 필드 배경
+    SDL_RenderFillRect(renderer, &input_box);
+    SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255); // 검정 테두리
+    SDL_RenderDrawRect(renderer, &input_box);
+
+    SDL_Color black = { 0, 0, 0, 255 };
+    render_text(renderer, font, input, x, y, black);
+}
+
+// SQLite 초기화 함수
+int init_db() {
+    int rc = sqlite3_open("todo_list.db", &db);
+    if (rc) {
+        printf("데이터베이스 열기 실패: %s\n", sqlite3_errmsg(db));
+        return rc;
+    }
+
+    const char* create_table_sql = "CREATE TABLE IF NOT EXISTS tasks (" \
+        "id INTEGER PRIMARY KEY AUTOINCREMENT, " \
+        "day INTEGER NOT NULL, " \
+        "task TEXT NOT NULL, " \
+        "is_checked INTEGER NOT NULL);";
+
+    rc = sqlite3_exec(db, create_table_sql, 0, 0, &err_msg);
+    if (rc != SQLITE_OK) {
+        printf("테이블 생성 실패: %s\n", err_msg);
+        return rc;
+    }
+    return SQLITE_OK;
+}
+
+// 할 일 추가 함수 (SQLite)
+void add_task_to_db(int day, const char* task, int checked) {
+    char sql[256];
+    snprintf(sql, sizeof(sql), "INSERT INTO tasks (day, task, is_checked) VALUES (%d, '%s', %d);", day, task, checked);
+    sqlite3_exec(db, sql, 0, 0, &err_msg);
+}
+
+// 할 일 불러오기 (SQLite)
+void load_tasks_from_db() {
+    sqlite3_stmt* stmt;
+    const char* sql = "SELECT day, task, is_checked FROM tasks ORDER BY day, id;";
+    int rc = sqlite3_prepare_v2(db, sql, -1, &stmt, 0);
+
+    if (rc != SQLITE_OK) {
+        printf("쿼리 준비 실패: %s\n", sqlite3_errmsg(db));
+        return;
+    }
+
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        int day = sqlite3_column_int(stmt, 0);
+        const char* task = (const char*)sqlite3_column_text(stmt, 1);
+        int is_checked_value = sqlite3_column_int(stmt, 2);
+
+        int task_index = task_counts[day - 1];
+        strncpy_s(tasks[day - 1][task_index], sizeof(tasks[day - 1][task_index]), task, TASK_LENGTH - 1);
+        is_checked[day - 1][task_index] = is_checked_value;
+        task_counts[day - 1]++;
+    }
+
+    sqlite3_finalize(stmt);
+}
+
+int main(int argc, char* argv[]) {
+    if (init_db() != SQLITE_OK) {
+        return -1;
+    }
+
+    // 데이터베이스에서 할 일 목록 불러오기
+    load_tasks_from_db();
+
+    if (SDL_Init(SDL_INIT_VIDEO) != 0 || TTF_Init() != 0) {
+        printf("SDL initialization failed: %s\n", SDL_GetError());
+        return -1;
+    }
+
+    SDL_Window* window = SDL_CreateWindow("To-Do List with Calendar",
+        SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
+        SCREEN_WIDTH, SCREEN_HEIGHT,
+        SDL_WINDOW_SHOWN);
+    SDL_Renderer* renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED);
+    TTF_Font* font = TTF_OpenFont("NanumSquareNeo-Variable.ttf", 24);
+
+    if (!font) {
+        printf("Font load failed: %s\n", TTF_GetError());
+        SDL_DestroyRenderer(renderer);
+        SDL_DestroyWindow(window);
+        SDL_Quit();
+        return -1;
+    }
+
+    SDL_Event e;
+    int quit = 0;
+
+    SDL_StartTextInput();
+
+    while (!quit) {
+        while (SDL_PollEvent(&e)) {
+            if (e.type == SDL_QUIT) {
+                quit = 1;
+            }
+            else if (e.type == SDL_TEXTINPUT) {
+                strcat_s(input_buffer, sizeof(input_buffer), e.text.text);
+            }
+            else if (e.type == SDL_KEYDOWN) {
+                if (e.key.keysym.sym == SDLK_BACKSPACE && strlen(input_buffer) > 0) {
+                    input_buffer[strlen(input_buffer) - 1] = '\0';
+                }
+                else if (e.key.keysym.sym == SDLK_RETURN && strlen(input_buffer) > 0) {
+                    add_task_to_db(selected_day, input_buffer, 0); // 체크 상태는 초기화해서 추가
+                    int task_index = task_counts[selected_day - 1];
+                    strncpy_s(tasks[selected_day - 1][task_index], sizeof(tasks[selected_day - 1][task_index]), input_buffer, TASK_LENGTH - 1);
+                    is_checked[selected_day - 1][task_index] = 0;
+                    task_counts[selected_day - 1]++;
+                    input_buffer[0] = '\0';
+                }
+            }
+            else if (e.type == SDL_MOUSEBUTTONDOWN) {
+                if (e.button.button == SDL_BUTTON_LEFT) {
+                    for (int i = 0; i < MAX_DAYS; i++) {
+                        int x = 50 + (i % 7) * 100;
+                        int y = 120 + (i / 7) * 50;
+
+                        if (e.button.x >= x && e.button.x <= x + 40 &&
+                            e.button.y >= y + 30 && e.button.y <= y + 70) {
+                            selected_day = i + 1;
+                        }
+                    }
+
+                    for (int i = 0; i < task_counts[selected_day - 1]; i++) {
+                        int checkbox_x = 50;
+                        int checkbox_y = 440 + i * 40;
+
+                        if (e.button.x >= checkbox_x && e.button.x <= checkbox_x + 20 &&
+                            e.button.y >= checkbox_y && e.button.y <= checkbox_y + 20) {
+                            is_checked[selected_day - 1][i] = !is_checked[selected_day - 1][i];
+                            // 체크된 상태를 데이터베이스에 업데이트
+                            char sql[256];
+                            snprintf(sql, sizeof(sql), "UPDATE tasks SET is_checked = %d WHERE day = %d AND task = '%s';",
+                                is_checked[selected_day - 1][i], selected_day, tasks[selected_day - 1][i]);
+                            sqlite3_exec(db, sql, 0, 0, &err_msg);
+                        }
+
+                        int delete_x = 400;
+                        int delete_y = checkbox_y;
+
+                        if (e.button.x >= delete_x && e.button.x <= delete_x + 20 &&
+                            e.button.y >= delete_y && e.button.y <= delete_y + 20) {
+                            delete_task(selected_day, i);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        render_background(renderer);
+        SDL_Color black = { 0, 0, 0, 255 };
+
+        // "12 DECEMBER" 텍스트 (좌측 최상단)
+        render_text(renderer, font, "12 DECEMBER", 20, 20, black);
+
+        // 달력 렌더링
+        render_calendar(renderer, font);
+
+        // "To-Do List" 텍스트
+        render_text(renderer, font, "To-Do List", 50, 400, black);
+
+        // 입력 필드 렌더링
+        render_input_field(renderer, font, input_buffer, 200, 400);
+
+        for (int i = 0; i < task_counts[selected_day - 1]; i++) {
+            render_checkbox(renderer, 50, 440 + i * 40, is_checked[selected_day - 1][i]);
+            render_text(renderer, font, tasks[selected_day - 1][i], 80, 440 + i * 40, black);
+
+            SDL_Rect delete_button = { 400, 440 + i * 40, 20, 20 };
+            SDL_SetRenderDrawColor(renderer, 255, 0, 0, 255); // 빨간색 버튼
+            SDL_RenderFillRect(renderer, &delete_button);
+            SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255);
+            SDL_RenderDrawRect(renderer, &delete_button);
+        }
+
+        SDL_RenderPresent(renderer);
+    }
+
+    SDL_StopTextInput();
+    TTF_CloseFont(font);
+    SDL_DestroyRenderer(renderer);
+    SDL_DestroyWindow(window);
+    SDL_Quit();
+
+    sqlite3_close(db);
+
+    return 0;
+}
